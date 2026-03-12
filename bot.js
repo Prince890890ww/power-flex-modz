@@ -665,4 +665,258 @@ bot.onText(/\/stats/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  if (userId
+  if (userId.toString() !== ADMIN_ID) {
+    await bot.sendMessage(chatId, '❌ Sirf admin use kar sakta hai.');
+    return;
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    // Total users
+    const [totalUsers] = await connection.query('SELECT COUNT(*) as count FROM telegram_users');
+    
+    // Total numbers
+    const [totalNumbers] = await connection.query('SELECT COUNT(*) as count FROM phone_numbers');
+    
+    // Available numbers
+    const [availableNumbers] = await connection.query(
+      'SELECT COUNT(*) as count FROM phone_numbers WHERE isAvailable = 1 AND deletedAt IS NULL'
+    );
+    
+    // Total OTP requests
+    const [totalOtps] = await connection.query('SELECT COUNT(*) as count FROM otp_logs');
+    
+    // Today's OTP requests
+    const [todayOtps] = await connection.query(
+      'SELECT COUNT(*) as count FROM otp_logs WHERE DATE(requestedAt) = CURDATE()'
+    );
+    
+    // Numbers by country
+    const [numbersByCountry] = await connection.query(
+      'SELECT country, countryFlag, COUNT(*) as count FROM phone_numbers WHERE deletedAt IS NULL GROUP BY country, countryFlag ORDER BY count DESC LIMIT 5'
+    );
+
+    let countryStats = '';
+    if (numbersByCountry.length > 0) {
+      countryStats = '\n\n📊 *Desh ke hisaab se numbers:*\n';
+      numbersByCountry.forEach(row => {
+        countryStats += `${row.countryFlag || '🌍'} ${row.country}: ${row.count} numbers\n`;
+      });
+    }
+
+    const stats = `📊 *Bot Statistics*\n\n` +
+      `👥 *Users:*\n` +
+      `Total Users: ${totalUsers[0].count}\n\n` +
+      `📱 *Phone Numbers:*\n` +
+      `Total: ${totalNumbers[0].count}\n` +
+      `Available: ${availableNumbers[0].count}\n` +
+      `In Use: ${totalNumbers[0].count - availableNumbers[0].count}` +
+      `${countryStats}\n\n` +
+      `📨 *OTP Requests:*\n` +
+      `Total: ${totalOtps[0].count}\n` +
+      `Today: ${todayOtps[0].count}\n\n` +
+      `⚙️ *System:*\n` +
+      `Node.js: ${process.version}`;
+
+    await bot.sendMessage(chatId, stats, { parse_mode: 'Markdown' });
+
+  } catch (error) {
+    console.error('Stats command error:', error);
+    await bot.sendMessage(chatId, '❌ Stats nikaalne mein error aaya.');
+  } finally {
+    connection.release();
+  }
+});
+
+// Callback query handler
+bot.on('callback_query', async (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id;
+  const userId = callbackQuery.from.id;
+  const data = callbackQuery.data;
+
+  try {
+    if (data === 'verify') {
+      const isVerified = await checkUserVerification(userId);
+      
+      if (isVerified) {
+        // Update user as verified in database
+        const connection = await pool.getConnection();
+        await connection.query(
+          'UPDATE telegram_users SET isVerified = 1 WHERE telegramId = ?',
+          [userId.toString()]
+        );
+        connection.release();
+
+        await bot.answerCallbackQuery(callbackQuery.id, { text: '✅ Verification successful!' });
+        await bot.sendMessage(chatId, '✅ *Verification Successful!*\n\nClick below to get a number:', {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📱 Get Number', callback_data: 'get_number' }]
+            ]
+          }
+        });
+      } else {
+        await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Please join both channels first!', show_alert: true });
+      }
+    }
+    else if (data === 'get_number') {
+      // Show country selection
+      const countryButtons = [];
+      let row = [];
+      
+      Object.keys(COUNTRY_FLAGS).forEach((code, index) => {
+        row.push({ text: `${COUNTRY_FLAGS[code]} ${code}`, callback_data: `country_${code}` });
+        if (row.length === 2 || index === Object.keys(COUNTRY_FLAGS).length - 1) {
+          countryButtons.push([...row]);
+          row = [];
+        }
+      });
+
+      await bot.sendMessage(chatId, '🌍 *Select your country:*', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: countryButtons
+        }
+      });
+    }
+    else if (data.startsWith('country_')) {
+      const country = data.replace('country_', '');
+      const result = await allocatePhoneNumber(userId, country);
+      
+      if (result.error) {
+        await bot.sendMessage(chatId, result.error);
+      } else {
+        const phoneNumber = result.phoneNumber;
+        
+        // Store number in user session
+        const connection = await pool.getConnection();
+        await connection.query(
+          'UPDATE telegram_users SET currentPhoneNumberId = ? WHERE telegramId = ?',
+          [phoneNumber.id, userId.toString()]
+        );
+        connection.release();
+
+        await bot.sendMessage(chatId,
+          `✅ *Number Allocated!*\n\n` +
+          `📱 *Number:* \`${phoneNumber.number}\`\n` +
+          `${phoneNumber.countryFlag} *Country:* ${COUNTRY_NAMES[phoneNumber.country] || phoneNumber.country}\n\n` +
+          `Use this number for OTP verification.\n\n` +
+          `👇 Click below to check SMS:`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '📨 Check SMS', callback_data: 'check_sms' }]
+              ]
+            }
+          }
+        );
+      }
+    }
+    else if (data === 'check_sms') {
+      // Get user's current number
+      const connection = await pool.getConnection();
+      try {
+        const [users] = await connection.query(
+          'SELECT currentPhoneNumberId FROM telegram_users WHERE telegramId = ?',
+          [userId.toString()]
+        );
+
+        if (users.length === 0 || !users[0].currentPhoneNumberId) {
+          await bot.sendMessage(chatId, '❌ Pehle number le lo /start se.');
+          return;
+        }
+
+        const [numbers] = await connection.query(
+          'SELECT * FROM phone_numbers WHERE id = ?',
+          [users[0].currentPhoneNumberId]
+        );
+
+        if (numbers.length === 0) {
+          await bot.sendMessage(chatId, '❌ Number nahi mila. /start karo.');
+          return;
+        }
+
+        const phoneNumber = numbers[0];
+        
+        // Show loading message
+        const loadingMsg = await bot.sendMessage(chatId, '⏳ OTP check ho raha hai...');
+
+        // Fetch OTP
+        const otpResult = await fetchOTP(phoneNumber.number);
+        
+        // Delete loading message
+        await bot.deleteMessage(chatId, loadingMsg.message_id);
+
+        if (otpResult.error) {
+          await bot.sendMessage(chatId, otpResult.error);
+        } else {
+          // Log OTP request
+          await connection.query(
+            'INSERT INTO otp_logs (telegramId, phoneNumberId, phoneNumber, otpCode, status) VALUES (?, ?, ?, ?, ?)',
+            [userId.toString(), phoneNumber.id, phoneNumber.number, otpResult.otp, 'success']
+          );
+
+          // Update usage count
+          await connection.query(
+            'UPDATE phone_numbers SET usageCount = usageCount + 1, lastUsedAt = NOW() WHERE id = ?',
+            [phoneNumber.id]
+          );
+
+          await bot.sendMessage(chatId,
+            `✅ *OTP Received!*\n\n` +
+            `📱 *Number:* \`${phoneNumber.number}\`\n` +
+            `🔑 *OTP Code:* \`${otpResult.otp}\`\n\n` +
+            `${otpResult.message || ''}`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      } finally {
+        connection.release();
+      }
+    }
+  } catch (error) {
+    console.error('Callback query error:', error);
+    await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Error processing request', show_alert: true });
+  }
+});
+
+// Start the bot
+async function startBot() {
+  try {
+    await initDatabase();
+    console.log('🤖 Bot started successfully!');
+    console.log(`👤 Admin ID: ${ADMIN_ID}`);
+    console.log(`📊 Rate limit: ${RATE_LIMIT_WINDOW/1000} seconds`);
+    
+    // Handle shutdown gracefully
+    process.on('SIGINT', async () => {
+      console.log('🛑 Shutting down bot...');
+      if (pool) {
+        await pool.end();
+        console.log('✅ Database connection closed');
+      }
+      process.exit(0);
+    });
+
+    process.on('SIGTERM', async () => {
+      console.log('🛑 Shutting down bot...');
+      if (pool) {
+        await pool.end();
+        console.log('✅ Database connection closed');
+      }
+      process.exit(0);
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to start bot:', error);
+    process.exit(1);
+  }
+}
+
+// Initialize bot
+startBot();
+
+// Export for testing (optional)
+module.exports = bot;
